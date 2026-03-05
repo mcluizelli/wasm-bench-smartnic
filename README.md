@@ -1,80 +1,90 @@
 # wasm-bench-smartnic
 
-WebAssembly Application Benchmarking on SmartNICs
+WebAssembly Application Benchmarking on SmartNIC Platforms
 
-This repository contains a lightweight benchmarking framework to evaluate WebAssembly applications running on SmartNIC-attached servers. The system consists of two main components: (i) guest applications compiled to WebAssembly (WASI), which represent different workload profiles, and (ii) a host runtime that loads and executes the WebAssembly modules through Wasmtime while exposing an HTTP interface for benchmarking tools such as `wrk`.
+This repository provides an experimental framework for benchmarking WebAssembly applications executed through a Rust host runtime. The system evaluates different types of workloads while collecting system-level and runtime-level measurements. The framework is designed to stress CPU, memory, and networking behavior while measuring execution overheads such as instantiation time, request latency, and hardware performance counters.
 
 ---
 
-## Repository Structure
+# Repository Overview
+
+The benchmark consists of two main components.
+
+**Guest applications** implement synthetic workloads compiled to WebAssembly (WASI). Each guest stresses a specific system resource such as CPU, memory, or networking.
+
+**Host runtime** loads and executes the WebAssembly module using Wasmtime. The host exposes an HTTP interface so external tools (e.g., `wrk`) can generate load.
+
+Typical directory structure:
 
 ```
 apps/
- ├── guest_*/        # Guest applications (CPU, memory, network workloads)
- └── host/           # Rust HTTP host that loads and executes WASM modules
-scripts/             # Benchmark automation and profiling scripts
-results/             # Experiment output directories
+ ├── guest_*/        # WebAssembly workloads
+ └── host/           # Rust host runtime
+scripts/             # benchmarking and aggregation scripts
+results/             # experiment outputs
 ```
-
-The **guest applications** implement synthetic workloads designed to stress specific system resources such as CPU, memory, or networking. The **host application** runs a WebAssembly runtime and exposes the guest function through an HTTP endpoint, allowing load generators to invoke the guest code repeatedly.
 
 ---
 
-## Compiling Guest Applications
+# Compiling Guest Applications
 
-Each guest application must be compiled to the **WASI WebAssembly target** and optionally ahead-of-time compiled to a `cwasm` module using Wasmtime.
+Each guest application must be compiled for the WASI target.
 
-1. Navigate to the guest application directory:
+Navigate to the guest directory:
 
 ```bash
 cd ./apps/guest_*/
 ```
 
-2. Install the WASI target (only required once):
+Install the WASI compilation target (only required once):
 
 ```bash
 rustup target add wasm32-wasip1
 ```
 
-3. Compile the guest application:
+Compile the guest application:
 
 ```bash
 cargo build --release --target wasm32-wasip1
 ```
 
-4. Optionally produce a precompiled Wasmtime module (`.cwasm`):
+The compiled WebAssembly module will be generated at:
+
+```
+target/wasm32-wasip1/release/guest.wasm
+```
+
+Optionally, precompile the module with Wasmtime to produce a `.cwasm` artifact:
 
 ```bash
 wasmtime compile target/wasm32-wasip1/release/guest.wasm -o guest.cwasm
 ```
 
-The `.cwasm` artifact avoids runtime compilation overhead and reduces startup latency during experiments.
+This reduces runtime compilation overhead during experiments.
 
 ---
 
-## Compiling the Host Application
+# Compiling the Host Runtime
 
-The host application is responsible for loading the WebAssembly module and exposing it through an HTTP server.
-
-1. Move to the host directory:
+Navigate to the host directory:
 
 ```bash
 cd ./apps/host
 ```
 
-2. Clean previous builds (optional but recommended):
+Clean previous builds (recommended):
 
 ```bash
 cargo clean
 ```
 
-3. Compile the host:
+Compile the host application:
 
 ```bash
 cargo build --release
 ```
 
-The resulting binary will be generated at:
+The host binary will be available at:
 
 ```
 ./target/release/host
@@ -82,42 +92,259 @@ The resulting binary will be generated at:
 
 ---
 
-## Running the Host
+# Running the Host
 
-To start the host runtime and load a guest application:
+To start the host and load a WebAssembly module:
 
 ```bash
 ./target/release/host ../guest_cpu_hash.wasm 8080
 ```
 
-This command launches the HTTP server and loads the specified WebAssembly module on port `8080`.
-
-Once running, the host can be benchmarked using tools such as `wrk` or other HTTP load generators.
+This command launches the runtime and exposes an HTTP server on port `8080`.
 
 ---
 
-## Benchmarking
+# Running Benchmark Experiments
 
-The repository includes scripts to automate experiments and collect system metrics such as:
+The benchmarking workflow uses the script below to run multiple configurations automatically.
 
-* CPU and memory utilization (`sar`, `pidstat`)
-* Hardware counters (`perf`)
-* Request latency and throughput (`wrk`)
-* Wasmtime execution metrics (startup, instantiation, execution times)
+Example experiment script:
 
-These scripts generate structured result directories that can later be aggregated and analyzed.
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+HOST_BIN="./host"
+
+for appName in guest_cpu_hash.wasm guest_cpu_multi.wasm guest_net_checksum.wasm guest_net_scan.wasm; do
+  for appNumber in $(seq 1 10); do
+    echo "nApp: $appNumber appName: $appName"
+
+    for flows in 50 100 500 1000; do
+      sudo ./profile_wrk.sh \
+        --host-cmd "$HOST_BIN ./$appName" \
+        --wrk-cmd  "wrk -t8 -c$flows -d30s -s post.lua http://127.0.0.1:__PORT__" \
+        --n-hosts "$appNumber" \
+        --base-port 8080 \
+        --out-dir "results-${appName}-${appNumber}-${flows}"
+    done
+  done
+done
+```
+
+The script sweeps three parameters:
+
+* **Guest application** (type of workload)
+* **Number of host instances**
+* **Number of concurrent flows**
+
+Each experiment creates a results directory with the pattern:
+
+```
+results-<application>-<num_hosts>-<flows>
+```
+
+Example:
+
+```
+results-guest_cpu_hash.wasm-4-500
+```
+
+Each directory contains system and runtime measurements.
 
 ---
 
-## Requirements
+# Collected Metrics
+
+During execution, the framework collects several types of measurements.
+
+### System metrics
+
+Generated by Linux profiling tools:
+
+```
+sar_cpu.txt
+sar_mem.txt
+perf_system.csv
+pidstat_host.txt
+```
+
+These provide CPU usage, memory usage, and hardware counters such as:
+
+* cycles
+* instructions
+* cache misses
+* branch misses
+
+---
+
+### Load generator metrics
+
+Produced by `wrk`:
+
+```
+wrk.port-8080.out.txt
+```
+
+These files contain:
+
+* request throughput (requests/sec)
+* average latency
+* latency distribution
+
+---
+
+### Host runtime metrics
+
+Each host instance records internal execution measurements:
+
+```
+hosts/port-8080/host_metrics.log
+```
+
+The log includes:
+
+Startup measurements:
+
+```
+engine_create_us
+module_load_us
+first_wasi_link_us
+first_instantiate_us
+ready_to_accept_us
+```
+
+Per-request measurements:
+
+```
+instantiate_total_us
+alloc_us
+write_us
+handle_us
+read_us
+dealloc_us
+total_us
+```
+
+---
+
+# Aggregating Results
+
+After experiments complete, multiple Python scripts can aggregate the collected measurements into CSV summaries.
+
+Run the aggregation scripts from the directory containing all `results-*` folders.
+
+### Aggregate host startup times
+
+```bash
+python3 aggregate_host_startup.py
+```
+
+Output example:
+
+```
+summary_host_startup.csv
+```
+
+---
+
+### Aggregate per-request host metrics
+
+```bash
+python3 aggregate_host_requests.py
+```
+
+This generates statistics such as:
+
+* mean
+* p50
+* p95
+* p99
+
+for each request phase.
+
+---
+
+### Aggregate hardware counters
+
+```bash
+python3 aggregate_perf.py
+```
+
+Extracts:
+
+* cycles
+* instructions
+* IPC
+* cache misses
+* branch misses
+
+---
+
+### Aggregate system CPU usage
+
+```bash
+python3 aggregate_sar.py
+```
+
+Produces average CPU and memory utilization across the experiment duration.
+
+---
+
+### Aggregate load generator metrics
+
+```bash
+python3 aggregate_wrk.py
+```
+
+Extracts:
+
+* average latency
+* requests per second
+* transfer rate
+
+---
+
+# Final Dataset
+
+After aggregation, the experiment produces multiple CSV datasets:
+
+```
+summary_host_startup.csv
+summary_host_requests.csv
+summary_perf.csv
+summary_sar.csv
+summary_wrk.csv
+```
+
+These files can be combined using Python, pandas, or spreadsheet tools to produce figures such as:
+
+* throughput vs flows
+* latency vs number of instances
+* CPU utilization vs workload type
+* IPC vs application type
+
+---
+
+# Requirements
+
+The following tools must be installed on the system:
 
 * Rust toolchain (`cargo`, `rustup`)
 * Wasmtime CLI
-* Linux profiling tools (`perf`, `sar`, `pidstat`)
-* `wrk` for HTTP load generation
+* `wrk` HTTP benchmarking tool
+* `perf`
+* `sysstat` (for `sar`)
+* `pidstat`
+
+Example installation (Ubuntu):
+
+```bash
+sudo apt install sysstat linux-tools-common linux-tools-$(uname -r) wrk
+```
 
 ---
 
-## License
+# License
 
-This repository is intended for research and experimental benchmarking of WebAssembly workloads on SmartNIC-enabled infrastructures.
+This repository is intended for research and experimental evaluation of WebAssembly workloads on SmartNIC-enabled systems.
